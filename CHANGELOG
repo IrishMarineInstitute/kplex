@@ -1,3 +1,47 @@
+v1.4: January 6th 2019
+* Fixed crash with checksumming enabled
+* Various queue length changes
+* Changed default input processing to "loose" for file interfaces
+* Minor change to how default values for "strict" applied
+* Fixed possible null pointer exception in serial interface argument processing
+* Minor changes to persistent tcp behaviour
+* Add support for B460800 and B230400 baud rates
+* Make lowering file descriptor limits debug rather than warning
+* Fix lack of null termination on interface names
+* Make ~/.kplex.conf per-user conf file on OSX deprecating previous location
+* Add -p option for pid file
+* Add man page
+* Fix errors in preamble parsing
+
+v1.3.4: June 26th 2016
+* Fixed bug with optional interfaces
+* Fixed udp port assignment bug
+
+v1.3.3: May 7th 2016
+* Fixed crash in udp code with openvpn
+* Fixed broken filtering
+
+v1.3.2: April 21st 2016
+* Added gpsd support
+* Fixed various udp handling bugs
+* Fixed various bugs on tcp reconnect
+* Improve reconnection handling
+* Added much more debugging
+* Give interfaces default names
+
+v1.3.1: September 27th 2015
+* Fixed various uninitialised pointer fixes
+* Updated Makefile for OpenWRT and github builds
+* Accept NULL as a sentence terminator with "strict=no"
+* Fixed problem with non-truncation of output files
+* Better guessing of UDP interface parameters
+* Define ACCESSPERMS, remove redundant declarations, add header guards
+* Fixed bug in source filtering
+* Added option to re-enable nagle for TCP interfaces
+* "-d" flag now documented with additional debugging
+* Default queue sizes reduced and SNDBUF size reduced
+* Added optional interface to filter rules
+
 v1.3: April 15th 2015
 * Added "preamble" option to tcp interfaces
 * Fixed bugs in failover specification parsing

@@ -1,8 +1,10 @@
 /* kplex.h
  * This file is part of kplex
- * Copyright Keith Young 2012-2015
+ * Copyright Keith Young 2012-2017
  * For copying information see the file COPYING distributed with this software
  */
+#ifndef KPLEX_H
+#define KPLEX_H
 #include <sys/types.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -16,27 +18,25 @@
 
 #ifdef __APPLE__
 #include <AvailabilityMacros.h>
-#define KPLEXHOMECONF "Library/Preferences/kplex.ini"
-#else
-#define KPLEXHOMECONF ".kplex.conf"
+#define KPLEXHOMECONFOSX "Library/Preferences/kplex.conf"
+#define KPLEXOLDHOMECONFOSX "Library/Preferences/kplex.ini"
 #endif
 
-#ifdef linux
-#define PTHREAD_MUTEX_RECURSIVE PTHREAD_MUTEX_RECURSIVE_NP
+#define KPLEXHOMECONF ".kplex.conf"
+
+#ifndef ACCESSPERMS
+#define ACCESSPERMS (S_IRWXU|S_IRWXG|S_IRWXO)
 #endif
 
 #define KPLEXGLOBALCONF "/etc/kplex.conf"
 
 #define DEFSRCNAME "kplex"
 
-#define DEFQUEUESZ 128
-#define SERIALQUESIZE 128
-#define BCASTQUEUESIZE 64
-#define TCPQUEUESIZE 128
-
+#define DEFQSIZE 16
 
 #define SENMAX 80
-#define SENBUFSZ 96
+/* This should be +2. Will be reduced in a future release */
+#define SENBUFSZ (SENMAX + 4)
 #define TAGMAX 80
 #define DEFPORT 10110
 #define DEFPORTSTRING "10110"
@@ -64,7 +64,8 @@
 #define TAG_ISRC 8
 
 extern int debuglevel;
-#define DEBUG(level,...) if (debuglevel >= level) logdebug(__VA_ARGS__)
+#define DEBUG(level,...) if (debuglevel >= level) logdebug(0, __VA_ARGS__)
+#define DEBUG2(level,...) if (debuglevel >= level) logdebug(errno, __VA_ARGS__)
 
 /* parsing states */
 enum sstate {
@@ -117,16 +118,20 @@ enum udptype {
 
 struct senblk {
     size_t len;
-    unsigned int src;
+    unsigned long src;
     struct senblk *next;
     char data[SENBUFSZ];
 };
 typedef struct senblk senblk_t;
 
+typedef struct iface iface_t;
+
 struct ioqueue {
+    iface_t *owner;
     pthread_mutex_t    q_mutex;
     pthread_cond_t    freshmeat;
     int active;
+    int drops;
     senblk_t *free;
     senblk_t *qhead;
     senblk_t *qtail;
@@ -155,9 +160,9 @@ struct kopts {
 struct srclist {
     union {
     unsigned int  id;
-    char *        name;
+    char *name;
     } src;
-    time_t    failtime;
+    time_t failtime;
     time_t lasttime;
     struct srclist *next;
 };
@@ -173,6 +178,10 @@ struct sfilter_rule {
         struct ratelimit *limit;
         struct srclist *source;
     } info;
+    union {
+        unsigned int id;
+        char *name;
+    } src;
     char match[5];
     struct sfilter_rule *next;
 };
@@ -190,7 +199,7 @@ typedef struct sfilter sfilter_t;
 
 struct iface {
     pthread_t tid;
-    unsigned int id;
+    unsigned long id;
     char *name;
     struct iface *pair;
     enum iotype direction;
@@ -211,8 +220,6 @@ struct iface {
     void (*write)(struct iface *);
     ssize_t (*readbuf)(struct iface *,char *buf);
 };
-
-typedef struct iface iface_t;
 
 struct iftypedef {
     enum itype  index;
@@ -254,7 +261,7 @@ void *ifdup_bcast(void *);
 void *ifdup_mcast(void *);
 void *ifdup_seatalk(void *);
 
-ioqueue_t *init_q(size_t);
+int init_q(iface_t *, size_t);
 
 senblk_t *next_senblk(ioqueue_t *);
 senblk_t *last_senblk(ioqueue_t *);
@@ -264,11 +271,12 @@ void flush_queue(ioqueue_t *);
 int link_interface(iface_t *);
 int unlink_interface(iface_t *);
 int link_to_initialized(iface_t *);
-void start_interface(void *ptr);
+void start_interface(void *);
 iface_t *ifdup(iface_t *);
 void iface_thread_exit(int);
 int next_config(FILE *,unsigned int *,char **,char **);
 
+int calcsum(const char *, size_t);
 iface_t *parse_file(char *);
 iface_t *parse_arg(char *);
 iface_t *get_default_global(void);
@@ -277,19 +285,21 @@ void free_filter(sfilter_t *);
 void logerr(int,char *,...);
 void logterm(int,char *,...);
 void logtermall(int,char *,...);
-void logdebug(char *,...);
+void logdebug(int, char *,...);
 void logwarn(char *,...);
 void loginfo(char *,...);
 void initlog(int);
 sfilter_t *addfilter(sfilter_t *);
 int senfilter(senblk_t *,sfilter_t *);
 int checkcksum(senblk_t *);
-unsigned int namelookup(char *);
-char *idlookup(unsigned int);
-int insertname(char *, unsigned int);
+unsigned long namelookup(char *);
+char *idlookup(unsigned long);
+int insertname(char *, unsigned long);
 void freenames(void);
 int cmdlineopt(struct kopts **, char *);
 void do_read(iface_t *);
 size_t gettag(iface_t *, char *, senblk_t *);
 
 extern struct iftypedef iftypes[];
+
+#endif /* KPLEX_H */

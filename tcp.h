@@ -4,12 +4,12 @@
  * For copying information see the file COPYING distributed with this software
  */
 
-#define DEFTCPQSIZE 128
 #define DEFSNDTIMEO 30
-#define DEFSNDBUF 2048
+#define DEFSNDBUF 1024
 #define DEFKEEPIDLE 30
 #define DEFKEEPINTVL 10
 #define DEFKEEPCNT 3
+#define MAXPREAMBLE 1024
 
 struct tcp_preamble {
     unsigned char * string;
@@ -20,7 +20,6 @@ struct if_tcp {
     int fd;
     size_t qsize;
     struct if_tcp_shared *shared;
-    struct tcp_preamble *preamble;
 };
 
 struct if_tcp_shared {
@@ -36,8 +35,13 @@ struct if_tcp_shared {
     unsigned keepintvl;
     unsigned keepcnt;
     unsigned sndbuf;
+    int nodelay;
+    int critical;
+    int fixing;
     pthread_mutex_t t_mutex;
+    pthread_cond_t fv;
     struct timeval tv;
+    struct tcp_preamble *preamble;
 };
 
 void cleanup_tcp(iface_t *ifa);

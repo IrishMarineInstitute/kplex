@@ -1,6 +1,6 @@
 /* tcp.c
  * This file is part of kplex
- * Copyright Keith Young 2012-2015
+ * Copyright Keith Young 2012-2016
  * For copying information see the file COPYING distributed with this software
  */
 
@@ -11,6 +11,7 @@
 #include <netinet/tcp.h>
 #include <signal.h>
 #include <sys/uio.h>
+#include <arpa/inet.h>
 
 /*
  * Duplicate struct if_tcp
@@ -30,8 +31,6 @@ void *ifdup_tcp(void *ift)
 
     if (newif->shared)
         newif->shared->donewith=0;
-
-    newif->preamble=NULL;
 
     return ((void *) newif);
 }
@@ -57,12 +56,13 @@ void cleanup_tcp(iface_t *ifa)
             free(ift->shared->port);
         if (ift->shared->host)
             free(ift->shared->host);
+        if (ift->shared->preamble) {
+            free((void *) ift->shared->preamble->string);
+            free((void *) ift->shared->preamble);
+        }
         pthread_mutex_destroy(&ift->shared->t_mutex);
+        pthread_cond_destroy(&ift->shared->fv);
         free(ift->shared);
-    }
-    if (ift->preamble) {
-        free((void *) ift->preamble->string);
-        free((void *) ift->preamble);
     }
 
     close(ift->fd);
@@ -70,17 +70,23 @@ void cleanup_tcp(iface_t *ifa)
 
 /*
  * Send a preamble string (if defined)
- * Args: Pointer to an if_tcp structure
+ * Args: Pointer to an if_tcp structure, pointer to tcp_preamble structure
  * Returns: 0 on success, -1 on error
  * Side effects: Preamble string written to the interface's file descriptor
  */
-int do_preamble(struct if_tcp *ift)
+int do_preamble(struct if_tcp *ift, struct tcp_preamble *preamble)
 {
     size_t towrite;
     ssize_t n;
 
-    for (towrite=ift->preamble->len;towrite;towrite-=n) {
-        if ((n=write(ift->fd,ift->preamble->string,towrite)) < 0)
+    if (preamble == NULL) {
+        if (ift->shared == NULL || ift->shared->preamble == NULL)
+            return (-1);
+        preamble=ift->shared->preamble;
+    }
+
+    for (towrite=preamble->len;towrite;towrite-=n) {
+        if ((n=write(ift->fd,preamble->string,towrite)) < 0)
             return(-1);
     }
     return(0);
@@ -89,7 +95,7 @@ int do_preamble(struct if_tcp *ift)
 /*
  * Set socket options to enable keepalives as required
  * Args: Pointer to an if_tcp structure
- * Returns: 0 on successi, -1 if any errors occur
+ * Returns: 0 on success, -1 if any errors occur
  * Side effects: Sets keepalive options on interface socket
  */
 int establish_keepalive(struct if_tcp *ift)
@@ -147,7 +153,7 @@ int establish_keepalive(struct if_tcp *ift)
 /*
  * Reconnect a lost connection in persist mode
  * Args: Pointer to interface and error raised by onnection failure
- * Returns: 0 on successi, -1 in the case of an unrecoverable error
+ * Returns: 0 on success, -1 in the case of an unrecoverable error
  * Side effects: Connection should be re-established on exit
  */
 int reconnect(iface_t *ifa, int err)
@@ -157,9 +163,9 @@ int reconnect(iface_t *ifa, int err)
     int retval=0;
     int on=1;
 
-    /* Ensure two threads in a bi-directional connection are not simultaneously
-     * trying to reconnect */
-    pthread_mutex_lock(&ift->shared->t_mutex);
+    DEBUG(3,"%s: Reconnecting (write) interface",ifa->name);
+
+    /* ift->shared_t_mutex should be locked by the calling routine */
 
     /* If the write timed out, we don't need to sleep before retrying */
     switch (err) {
@@ -181,6 +187,7 @@ int reconnect(iface_t *ifa, int err)
             retval=-1;
             break;
         }
+        DEBUG(6,"%s: Reconnecting...",ifa->name);
         if (connect(ift->fd,(const struct sockaddr *)
                 &ift->shared->sa,ift->shared->sa_len) == 0) {
             break;
@@ -198,22 +205,25 @@ int reconnect(iface_t *ifa, int err)
             retval = -1;
         }
     }
+    DEBUG(3,"%s: Reconnected (write) interface",ifa->name);
     if (retval == 0) {
         if (ifa->pair) {
                 iftp = (struct if_tcp *) ifa->pair->info;
                 iftp->fd = ift->fd;
             }
-        if (setsockopt(ift->fd,IPPROTO_TCP,TCP_NODELAY,&on,sizeof(on)) < 0)
+        if (ift->shared->nodelay &&
+                (setsockopt(ift->fd,IPPROTO_TCP,TCP_NODELAY,&on,sizeof(on))
+                < 0))
             logerr(errno,"Could not disable Nagle on new tcp connection");
         (void) establish_keepalive(ift);
-        if (ift->preamble){
-            do_preamble(ift);
+        if (ift->shared->preamble){
+            do_preamble(ift,NULL);
         }
     }
 
+    DEBUG(7,"Flushing queue interface %s",ifa->name);
     flush_queue(ifa->q);
 
-    pthread_mutex_unlock(&ift->shared->t_mutex);
     return(retval);
 }
 
@@ -233,7 +243,8 @@ ssize_t reread(iface_t *ifa, char *buf, int bsize)
     int fflags;
     int on=1;
 
-    pthread_mutex_lock(&ift->shared->t_mutex);
+    DEBUG(3,"%s: Reconnecting (read) interface",ifa->name);
+    /* ift->shared->t_mutex should be held by the calling routine */
     /* Make socket non-blocking so we don't hold the mutex longer
      * than necessary */
     if ((fflags=fcntl(ift->fd,F_GETFL)) < 0) {
@@ -259,38 +270,43 @@ ssize_t reread(iface_t *ifa, char *buf, int bsize)
                 }
 
                 mysleep(ift->shared->retry);
-                nread=connect(ift->fd,(const struct sockaddr *)&ift->shared->sa,
-                        ift->shared->sa_len);
+                DEBUG(7,"%s: Retrying connection...",ifa->name);
+                if ((nread=connect(ift->fd,
+                        (const struct sockaddr *)&ift->shared->sa,
+                        ift->shared->sa_len)) == 0)
+                    DEBUG(3,"%s: Reconnected (read) interface",ifa->name);
+
             }
         } else {
             nread=0;
         }
     }
-
-
-    if (fcntl(ift->fd,F_SETFL,fflags) < 0) {
-        logerr(errno,"Failed to make tcp socket blocking");
-        nread=-1;
-    }
-
-    (void) establish_keepalive(ift);
-
-    if (ifa->direction == IN) {
-        if (!(iftp = (struct if_tcp *) ifa->pair->info)) {
-            logerr(errno,
-                "No pair information found for bi-directional tcp connection!");
+    if (nread >= 0) {
+        if (fcntl(ift->fd,F_SETFL,fflags) < 0) {
+            logerr(errno,"Failed to make tcp socket blocking");
             nread=-1;
-        } else {
-            if (setsockopt(ift->fd,IPPROTO_TCP,TCP_NODELAY,&on,sizeof(on)) < 0)
-                logerr(errno,"Could not disable Nagle on new tcp connection");
+        }
+    }
+    if (nread == 0) {
+        (void) establish_keepalive(ift);
 
-            iftp->fd = ift->fd;
-            if (iftp->preamble)
-                do_preamble(iftp);
+        if (ifa->pair) {
+            if (!(iftp = (struct if_tcp *) ifa->pair->info)) {
+                logerr(errno,"No pair information found for bi-directional tcp connection!");
+                nread=-1;
+            } else {
+                if (ift->shared->nodelay && (setsockopt(ift->fd,IPPROTO_TCP,
+                        TCP_NODELAY,&on,sizeof(on)) < 0))
+                    logerr(errno,
+                            "Could not disable Nagle on new tcp connection");
+
+                iftp->fd = ift->fd;
+                if (iftp->shared->preamble)
+                    do_preamble(iftp,NULL);
+            }
         }
     }
 
-    pthread_mutex_unlock(&ift->shared->t_mutex);
     return(nread);
 }
 
@@ -298,21 +314,80 @@ ssize_t read_tcp(struct iface *ifa, char *buf)
 {
     struct if_tcp *ift = (struct if_tcp *) ifa->info;
     ssize_t nread;
+    int done=0;
 
-    /* Man pages lie!  On FreeBSD, Linux and OS X, SIGPIPE is NOT delivered
-     * to a process reading from socket which times out due to unreplied to
-     * keepalives.  Instead the read exits with ETIMEDOUT
+    /* Wow this is ugly and due a complete re-write.  In persist mode we first
+       check if a pair thread (ie writer to this thread's reader on a bi-
+       directional interface) has tried and failed to reconnect and if yes
+       then we exit.  If not we increment a counter before entering blocking
+       read. This is mainly for consistency with the write side.  If we don't
+       read something (EOF or error) we exit if persist is not set but if it
+       is set we check if there's another thread in the critical region
+       (critical == 2).  If there is we do a shutdown on the socket and wait for
+       the partner thread.  Once it catches up it waits, we fix the problem,
+       then signal to the other thread to re-start.
+
+       If there's no error on read we first check if another thread is waiting
+       for this thread to fix a problem. If it is we tell it to go ahead and
+       fix it because we're just leaving the critical region.
      */
-    for(;;) {
-        if ((nread=read(ift->fd,buf,BUFSIZ)) <=0) {
-            if (!flag_test(ifa,F_PERSIST))
-                break;
-            if ((nread=reread(ifa,buf,BUFSIZ)) < 0) {
-                logerr(errno,"failed to reconnect tcp connection");
+
+    for(nread=0;nread<=0;) {
+        if (flag_test(ifa,F_PERSIST)) {
+            pthread_mutex_lock(&ift->shared->t_mutex);
+            if (ift->fd == -1)
+                done++;
+            else
+                ift->shared->critical++;
+            pthread_mutex_unlock(&ift->shared->t_mutex);
+            if (done) {
+                nread=-1;
                 break;
             }
-        } else {
-            break;
+        }
+    
+        /* Man pages lie!  On FreeBSD, Linux and OS X, SIGPIPE is NOT delivered
+         * to a process reading from socket which times out due to unreplied to
+         * keepalives.  Instead the read exits with ETIMEDOUT
+         */
+        nread=read(ift->fd,buf,BUFSIZ);
+        if (nread <= 0) {
+            if (nread) {
+                DEBUG(3,"%s: %s",ifa->name,"Read Failed");
+            } else {
+                DEBUG(3,"%s: EOF",ifa->name);
+            }
+
+            if (!flag_test(ifa,F_PERSIST))
+                break;
+            pthread_mutex_lock(&ift->shared->t_mutex);
+            if (ift->shared->fixing) {
+                pthread_cond_signal(&ift->shared->fv);    
+                pthread_cond_wait(&ift->shared->fv,&ift->shared->t_mutex);
+            } else {
+                if (ift->shared->critical == 2) {
+                    ift->shared->fixing++;
+                    (void) shutdown(ift->fd,SHUT_RDWR);
+                    pthread_cond_wait(&ift->shared->fv,&ift->shared->t_mutex);
+                }
+                if ((nread=reread(ifa,buf,BUFSIZ)) < 0) {
+                    if (ifa->pair)
+                        ((struct if_tcp *)ifa->pair->info)->fd=-1;
+                    logerr(errno,"failed to reconnect tcp connection");
+                }
+                if (ift->shared->fixing) {
+                    ift->shared->fixing=0;
+                    pthread_cond_signal(&ift->shared->fv);
+                }
+            }
+            ift->shared->critical--;
+            pthread_mutex_unlock(&ift->shared->t_mutex);
+        } else if (flag_test(ifa,F_PERSIST)) {
+            pthread_mutex_lock(&ift->shared->t_mutex);
+            ift->shared->critical--;
+            if (ift->shared->fixing)
+                pthread_cond_signal(&ift->shared->fv);
+            pthread_mutex_unlock(&ift->shared->t_mutex);
         }
     }
     return nread;
@@ -322,14 +397,17 @@ void write_tcp(struct iface *ifa)
 {
     struct if_tcp *ift = (struct if_tcp *) ifa->info;
     senblk_t *sptr;
-    int status,err;
+    int status=0;
+    int err=0;
     int data=0;
     int cnt=1;
+    int done = 0;
     struct iovec iov[2];
+
     if (ifa->tagflags) {
         if ((iov[0].iov_base=malloc(TAGMAX)) == NULL) {
-                logerr(errno,"Disabing tag output on interface id %u (%s)",
-                        ifa->id,(ifa->name)?ifa->name:"unlabelled");
+                logerr(errno,"Disabing tag output on interface id %x (%s)",
+                        ifa->id,ifa->name);
                 ifa->tagflags=0;
         } else {
             cnt=2;
@@ -337,7 +415,7 @@ void write_tcp(struct iface *ifa)
         }
     }
 
-    for(;;) {
+    for(;(!done);) {
 
         if ((sptr = next_senblk(ifa->q)) == NULL)
             break;
@@ -349,8 +427,8 @@ void write_tcp(struct iface *ifa)
 
         if (ifa->tagflags)
             if ((iov[0].iov_len = gettag(ifa,iov[0].iov_base,sptr)) == 0) {
-                logerr(errno,"Disabing tag output on interface id %u (%s)",
-                        ifa->id,(ifa->name)?ifa->name:"unlabelled");
+                logerr(errno,"Disabing tag output on interface id %x (%s)",
+                        ifa->id,ifa->name);
                 ifa->tagflags=0;
                 cnt=1;
                 data=0;
@@ -361,18 +439,54 @@ void write_tcp(struct iface *ifa)
          */
         iov[data].iov_base=sptr->data;
         iov[data].iov_len=sptr->len;
-        if (writev(ift->fd,iov,cnt) <0) {
-            err=errno;
-            if (!flag_test(ifa,F_PERSIST))
-                break;
-            senblk_free(sptr,ifa->q);
-            if ((status=reconnect(ifa,err)) == 0)
-                continue;
-            else {
-                if (status < 0)
-                    logerr(errno,"failed to reconnect tcp connection");
+        if (flag_test(ifa,F_PERSIST)) {
+            pthread_mutex_lock(&ift->shared->t_mutex);
+            if (ift->fd == -1)
+                done++;
+            else
+                ift->shared->critical++;
+            pthread_mutex_unlock(&ift->shared->t_mutex);
+            if (done) {
+                senblk_free(sptr,ifa->q);
                 break;
             }
+        }
+        if (writev(ift->fd,iov,cnt) <0) {
+            DEBUG2(3,"%s id %x: write failed",ifa->name,ifa->id);
+            err=errno;
+            if (!flag_test(ifa,F_PERSIST)) {
+                senblk_free(sptr,ifa->q);
+                break;
+            }
+            pthread_mutex_lock(&ift->shared->t_mutex);
+            if (ift->shared->fixing) {
+                pthread_cond_signal(&ift->shared->fv);
+                pthread_cond_wait(&ift->shared->fv,&ift->shared->t_mutex);
+            } else {
+                if (ift->shared->critical == 2) {
+                    ift->shared->fixing++;
+                    (void) shutdown(ift->fd,SHUT_RDWR);
+                    pthread_cond_wait(&ift->shared->fv,&ift->shared->t_mutex);
+                }
+                if ((status=reconnect(ifa,err)) <  0) {
+                    if (ifa->pair)
+                        ((struct if_tcp *) ifa->pair->info)->fd=-1;
+                    logerr(errno,"failed to reconnect tcp connection");
+                    done++;
+                }
+                if (ift->shared->fixing) {
+                    ift->shared->fixing=0;
+                    pthread_cond_signal(&ift->shared->fv);
+                }
+            }
+            ift->shared->critical--;
+            pthread_mutex_unlock(&ift->shared->t_mutex);
+        } else if (flag_test(ifa,F_PERSIST)) {
+            pthread_mutex_lock(&ift->shared->t_mutex);
+            ift->shared->critical--;
+            if (ift->shared->fixing)
+                pthread_cond_signal(&ift->shared->fv);
+            pthread_mutex_unlock(&ift->shared->t_mutex);
         }
         senblk_free(sptr,ifa->q);
     }
@@ -422,7 +536,9 @@ void delayed_connect(iface_t *ifa)
             free(ift->shared->host);
             free(ift->shared->port);
             ift->shared->host=ift->shared->port=NULL;
-            if (setsockopt(ift->fd,IPPROTO_TCP,TCP_NODELAY,&on,sizeof(on)) < 0)
+            if (ift->shared->nodelay &&
+                    (setsockopt(ift->fd,IPPROTO_TCP,TCP_NODELAY,&on,sizeof(on))
+                        < 0))
                 logerr(errno,"Could not disable Nagle on new tcp connection");
 
             (void) establish_keepalive(ift);
@@ -430,7 +546,14 @@ void delayed_connect(iface_t *ifa)
                 iftp = (struct if_tcp *) ifa->pair->info;
                 iftp->fd = ift->fd;
             }
+            /* do preamble */
+            if (ift->shared->preamble)
+                do_preamble(ift,NULL);
+
+            DEBUG(3,"%s: Completed delayed connect",ifa->name);
+
         } else {
+            DEBUG(4,"%s: Delayed connect failed (sleeping)",ifa->name);
             mysleep(ift->shared->retry);
         }
     }
@@ -440,10 +563,6 @@ void delayed_connect(iface_t *ifa)
     if (ifa->direction == IN)
         do_read(ifa);
     else {
-        /* do preamble */
-        if (ift->preamble)
-            do_preamble(ift);
-
         write_tcp(ifa);
     }
 }
@@ -457,13 +576,17 @@ iface_t *new_tcp_conn(int fd, iface_t *ifa)
     int on=1;
     sigset_t set,saved;
 
-    if ((newifa = malloc(sizeof(iface_t))) == NULL)
+    if ((newifa = malloc(sizeof(iface_t))) == NULL) {
+        logerr(errno,"malloc failed for %s",ifa->name);
         return(NULL);
+    }
 
     memset(newifa,0,sizeof(iface_t));
+
     if (((newift = (struct if_tcp *) malloc(sizeof(struct if_tcp))) == NULL) ||
             ((ifa->direction != IN) &&
-            ((newifa->q=init_q(oldift->qsize)) == NULL))) {
+            (init_q(newifa, oldift->qsize) < 0))) {
+        logerr(errno,"Failed to set up new connection");
         if (newifa && newifa->q)
             free(newifa->q);
         if (newift)
@@ -471,8 +594,9 @@ iface_t *new_tcp_conn(int fd, iface_t *ifa)
         free(newifa);
         return(NULL);
     }
+    memset(newift,0,sizeof(struct if_tcp));
+
     newift->fd=fd;
-    newift->preamble=NULL;
     newift->shared=NULL;
     newifa->id=ifa->id+(fd&IDMINORMASK);
     newifa->direction=ifa->direction;
@@ -526,17 +650,33 @@ iface_t *new_tcp_conn(int fd, iface_t *ifa)
 
 void tcp_server(iface_t *ifa)
 {
-    struct if_tcp *ift=(struct if_tcp *)ifa->info;
     int afd;
+    socklen_t slen;
+    struct if_tcp *ift=(struct if_tcp *)ifa->info;
+    iface_t * newifa;
+    struct sockaddr_storage sad;
+    char addrs[INET6_ADDRSTRLEN];
 
 
     if (listen(ift->fd,5) == 0) {
         while(ifa->direction != NONE) {
-         if ((afd = accept(ift->fd,NULL,NULL)) < 0)
-             break;
+            slen = sizeof(struct sockaddr_storage);
+            if ((afd = accept(ift->fd,(struct sockaddr *) &sad,&slen)) < 0) {
+                afd=errno;
+                logerr(errno,"accept failed for connection to %s",ifa->name);
+                continue;
+            }
     
-         if (new_tcp_conn(afd,ifa) == NULL)
-             close(afd);
+            if ((newifa = new_tcp_conn(afd,ifa)) == NULL) {
+                close(afd);
+                afd=-1;
+            }
+            DEBUG(3,"%s: New connection id %x %ssuccessfully received from %s",
+                    ifa->name,newifa->id,(afd<0)?"un":"",
+                    inet_ntop(sad.ss_family,(sad.ss_family == AF_INET)?
+                    (const void *) &((struct sockaddr_in *)&sad)->sin_addr:
+                    (const void *) &((struct sockaddr_in6 *)&sad)->sin6_addr,
+                    addrs,INET6_ADDRSTRLEN));
         }
     }
     iface_thread_exit(errno);
@@ -546,11 +686,11 @@ struct tcp_preamble *parse_preamble(const char * val)
 {
     const unsigned char *optr = (unsigned char *) val;
     unsigned char *ptr;
-    unsigned char prebuf[1024];
+    unsigned char prebuf[MAXPREAMBLE];
     int count,tval,i;
     struct tcp_preamble *preamble;
 
-    for (count=0,ptr=prebuf;*optr;count++,optr++) {
+    for (count=0,ptr=prebuf;*optr && count < MAXPREAMBLE;count++,optr++) {
         if (*optr == '\\') {
             switch (*(++optr)) {
             case 'a':
@@ -589,7 +729,7 @@ struct tcp_preamble *parse_preamble(const char * val)
                         return(NULL);
                     tval<<=4;
                     if (*optr >= '0' && *optr <= '9')
-                        tval += *ptr - '0';
+                        tval += *optr - '0';
                     else if (*optr >= 'a' && *optr <= 'f')
                         tval += (*optr - 'a' + 10);
                     else if (*optr >= 'A' && *optr <= 'F')
@@ -603,8 +743,10 @@ struct tcp_preamble *parse_preamble(const char * val)
                 return(NULL);
             default:
                 for (i=0,tval=0;i<3;i++) {
-                    tval <<=3;
-                    ++optr;
+                    if (i) {
+                        ++optr;
+                        tval <<=3;
+                    }
                     if (*optr >= '0' && *optr <= '7')
                         tval += (*optr - '0');
                     else if (i == 0) {
@@ -614,17 +756,21 @@ struct tcp_preamble *parse_preamble(const char * val)
                         return(NULL);
                 }
                 if (i == 3) {
-                    if (tval < 256)
+                    if (tval < 512)
                         *ptr++ = (unsigned char) tval;
                     else
                         return(NULL);
-                } else
-                    *ptr++ = *optr++;
+                }
                 break;
             }
         } else
             *ptr++=*optr;
     }
+    if (count == MAXPREAMBLE) {
+        logerr(0,"Specified preamble is too long: Max %d chars",MAXPREAMBLE);
+        return(0);
+    }
+
     if ((preamble = (struct tcp_preamble *)
             malloc(sizeof(struct tcp_preamble))) == NULL) {
         logerr(errno,"Failed to allocate memory for preamble");
@@ -649,6 +795,7 @@ iface_t *init_tcp(iface_t *ifa)
     char *host,*port,*eptr=NULL;
     struct addrinfo hints,*connection,*abase;
     struct servent *svent;
+    struct tcp_preamble *preamble=NULL;
     int err;
     int on=1,off=0;
     char *conntype = "c";
@@ -661,7 +808,9 @@ iface_t *init_tcp(iface_t *ifa)
     unsigned keepintvl=0;
     unsigned keepcnt=0;
     unsigned sndbuf=DEFSNDBUF;
+    int nodelay=1;
     long timeout=-1;
+    int gpsd=0;
 
     host=port=NULL;
 
@@ -670,9 +819,9 @@ iface_t *init_tcp(iface_t *ifa)
         return(NULL);
     }
 
-    ift->qsize=DEFTCPQSIZE;
+    ift->qsize=DEFQSIZE;
     ift->shared=NULL;
-    ift->preamble=NULL;
+    preamble=NULL;
 
     for(opt=ifa->options;opt;opt=opt->next) {
         if (!strcasecmp(opt->var,"address"))
@@ -690,7 +839,8 @@ iface_t *init_tcp(iface_t *ifa)
                 logerr(0,"retry valid only valid with persist option");
                 return(NULL);
             }
-            if ((retry=strtol(opt->val,&eptr,0)) == 0 && errno) {
+            errno=0;
+            if ((retry=strtol(opt->val,&eptr,0)) == 0 || (errno)) {
                 logerr(0,"retry value %s out of range",opt->val);
                 return(NULL);
             }
@@ -757,9 +907,33 @@ iface_t *init_tcp(iface_t *ifa)
                 logerr(0,"Invalid sndbuf size value specified: %s",opt->val);
                 return(NULL);
             }
+        } else if (!strcasecmp(opt->var,"gpsd")) {
+            if (!strcasecmp(opt->val,"yes")) {
+                gpsd=1;
+                if (!port)
+                    port="2947";
+            } else if (!strcasecmp(opt->val,"no")) {
+                gpsd=0;
+            } else {
+                logerr(0,"Invalid option \"gpsd=%s\"",opt->val);
+                return(NULL);
+            }
         } else if (!strcasecmp(opt->var,"preamble")) {
-            if ((ift->preamble=parse_preamble(opt->val)) == NULL) {
+            if (preamble) {
+                logerr(0,"Can only specify preamble once");
+                return(NULL);
+            }
+            if ((preamble=parse_preamble(opt->val)) == NULL) {
                 logerr(0,"Could not parse preamble %s",opt->val);
+                return(NULL);
+            }
+        } else if (!strcasecmp(opt->var,"nodelay")) {
+            if (!strcasecmp(opt->val,"no")) {
+                nodelay=0;
+            } else if (!strcasecmp(opt->val,"yes")) {
+                nodelay=1;
+            } else {
+                logerr(0,"Invalid option \"nodelay=%s\"",opt->val);
                 return(NULL);
             }
         } else  {
@@ -789,14 +963,28 @@ iface_t *init_tcp(iface_t *ifa)
             logerr(0,"Must specify address for tcp client mode\n");
             return(NULL);
         }
+        if (gpsd) {
+            if (preamble) {
+                logerr(0,"Can't specify preamble with proto=gpsd");
+                return(NULL);
+            }
+            preamble=parse_preamble("?WATCH={\"enable\":true,\"nmea\":true}");
+        }
     } else {
         if (flag_test(ifa,F_PERSIST)) {
             logerr(0,"persist option not valid for tcp servers");
             return(NULL);
         }
 
-        if (ift->preamble) {
+        if (preamble) {
             logerr(0,"preamble option not valid for servers");
+            free(preamble->string);
+            free(preamble);
+            return(NULL);
+        }
+
+        if (gpsd) {
+            logerr(0,"proto=gpsd not valid for servers");
             return(NULL);
         }
     }
@@ -866,6 +1054,11 @@ iface_t *init_tcp(iface_t *ifa)
             return(NULL);
         }
 
+        if (pthread_cond_init(&ift->shared->fv,NULL) != 0) {
+            logerr(errno,"tcp condition variable initialisation failed");
+            return(NULL);
+        }
+
         ift->shared->retry=retry;
         if (ift->shared->retry != retry) {
             logerr(0,"retry value out of range");
@@ -879,8 +1072,12 @@ iface_t *init_tcp(iface_t *ifa)
         } else {
             ift->shared->host=strdup(host);
             ift->shared->port=strdup(port);
+            DEBUG(3,"%s: Initial connection to %s port %s failed",ifa->name,
+                    host,port);
         }
         ift->shared->donewith=1;
+        ift->shared->critical=0;
+        ift->shared->fixing=0;
         ift->shared->keepalive=keepalive;
         ift->shared->keepidle=keepidle;
         ift->shared->keepintvl=keepintvl;
@@ -888,6 +1085,8 @@ iface_t *init_tcp(iface_t *ifa)
         ift->shared->sndbuf=sndbuf;
         ift->shared->tv.tv_sec=timeout;
         ift->shared->tv.tv_usec=0;
+        ift->shared->nodelay=nodelay;
+        ift->shared->preamble=preamble;
     }
 
     freeaddrinfo(abase);
@@ -898,17 +1097,14 @@ iface_t *init_tcp(iface_t *ifa)
 
     if ((*conntype == 'c') && (ifa->direction != IN)) {
     /* This is an unusual but supported combination */
-        if ((ifa->q =init_q(ift->qsize)) == NULL) {
+        if (init_q(ifa, ift->qsize) < 0) {
             logerr(errno,"Interface duplication failed");
             return(NULL);
         }
         /* Disable Nagle. Not fatal if we fail for any reason */
         if (connection) {
-            if (setsockopt(ift->fd,IPPROTO_TCP,TCP_NODELAY,&on,sizeof(on)) < 0)
+            if (nodelay && (setsockopt(ift->fd,IPPROTO_TCP,TCP_NODELAY,&on,sizeof(on)) < 0))
                 logerr(errno,"Could not disable Nagle algorithm for tcp socket");
-            /* do preamble */
-            if (ift->preamble)
-                do_preamble(ift);
         }
     }
 
@@ -916,6 +1112,13 @@ iface_t *init_tcp(iface_t *ifa)
     ifa->info = (void *) ift;
     if (*conntype == 'c') {
         if (connection) {
+            if (preamble) {
+                do_preamble(ift,preamble);
+                if (ift->shared == NULL) {
+                    free(preamble->string);
+                    free(preamble);
+                }
+            }
             ifa->read=do_read;
             ifa->write=write_tcp;
         } else {
@@ -936,5 +1139,6 @@ iface_t *init_tcp(iface_t *ifa)
         ifa->read=tcp_server;
     }
     free_options(ifa->options);
+    DEBUG(3,"%s: initialised",ifa->name);
     return(ifa);
 }

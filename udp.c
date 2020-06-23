@@ -1,6 +1,6 @@
 /* udp.c
  * This file is part of kplex
- * Copyright Keith Young 2015
+ * Copyright Keith Young 2015 - 2016
  * For copying information see the file COPYING distributed with this software
  *
  * UDP interfaces
@@ -12,7 +12,6 @@
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 
-#define DEFUDPQSIZE 64
 #define CBUFSIZ 128
 
 static struct ignore_addr {
@@ -58,6 +57,9 @@ void *ifdup_udp(void *ifa)
         return(NULL);
 
     (void) memcpy(newif, oldif, sizeof(struct if_udp));
+
+    /* In-bound connections don't need pointer to coalesce buffer */
+    newif->coalesce = NULL;
 
     /* Whole new file descriptor to bind() to.  Not an issue for Linux but
      * for some other platforms (e.g. OS X) we can't send with a multicast /
@@ -209,8 +211,7 @@ void write_udp(struct iface *ifa)
 
     if (ifa->tagflags) {
         if ((iov[0].iov_base=malloc(TAGMAX)) == NULL) {
-                logerr(errno,"Disabing tag output on interface id %u (%s)",
-                        ifa->id,(ifa->name)?ifa->name:"unlabelled");
+                logerr(errno,"%s: Disabing tag output",ifa->name);
                 ifa->tagflags=0;
         } else {
             msgh.msg_iovlen=2;
@@ -228,8 +229,7 @@ void write_udp(struct iface *ifa)
 
         if (ifa->tagflags)
             if ((iov[0].iov_len = gettag(ifa,iov[0].iov_base,sptr)) == 0) {
-                logerr(errno,"Disabing tag output on interface id %u (%s)",
-                        ifa->id,(ifa->name)?ifa->name:"unlabelled");
+                logerr(errno,"%s: Disabing tag output",ifa->name);
                 ifa->tagflags=0;
                 msgh.msg_iovlen=1;
                 data=0;
@@ -273,6 +273,8 @@ ssize_t read_udp(iface_t *ifa, char *buf)
     mh.msg_iov = &iov;
     mh.msg_iovlen = 1;
     mh.msg_control = NULL;
+    mh.msg_controllen = 0;
+    mh.msg_flags = 0;
 
     do {
         nread = recvmsg(ifu->fd,&mh,0);
@@ -325,18 +327,20 @@ struct iface *init_udp(struct iface *ifa)
     struct if_udp *ifu;
     struct addrinfo hints,*aptr,*abase;
     struct ifaddrs *ifap=NULL,*ifp;
-    char *address,*service,*ifname;
+    char *address,*service,*ifname,*eptr;
     struct servent *svent;
-    size_t qsize = DEFUDPQSIZE;
+    size_t qsize = DEFQSIZE;
     struct kopts *opt;
     int coalesce=0;
     int ifindex,iffound=0;
     int linklocal=0;
     int on=1,off=0;
     int err;
+    int port;
     struct sockaddr_storage laddr;
     struct sockaddr *sa;
     struct ignore_addr *igp;
+    char debugbuf[INET6_ADDRSTRLEN];
     
     if ((ifu=malloc(sizeof(struct if_udp))) == NULL) {
         logerr(errno,"Could not allocate memory");
@@ -387,39 +391,57 @@ struct iface *init_udp(struct iface *ifa)
     }
 
     if (!service) {
-        if ((svent = getservbyname("nmea-0183","udp")) != NULL)
+        if ((svent = getservbyname("nmea-0183","udp")) != NULL) {
             service=svent->s_name;
-        else
+            port=svent->s_port;
+        } else {
             service=DEFPORTSTRING;
+            port=DEFPORT;
+        }
+    } else if (!address) {
+        if ((port=strtol(service,&eptr,0)) <= 0 || port >= 65536 || *eptr != '\0') {
+            if ((svent = getservbyname(service,"udp")) != NULL)
+                port=svent->s_port;
+            else
+                port=DEFPORT;
+        }
     }
 
-    memset((void *)&hints,0,sizeof(hints));
+    if (address || ifa->direction == IN) {
+        memset((void *)&hints,0,sizeof(hints));
 
-    hints.ai_flags=(ifa->direction==IN)?AI_PASSIVE:0;
-    hints.ai_family=AF_UNSPEC;
-    hints.ai_socktype=SOCK_DGRAM;
-    hints.ai_protocol=IPPROTO_UDP;
+        hints.ai_flags=(ifa->direction==IN)?AI_PASSIVE:0;
 
-    if ((err=getaddrinfo(address,service,&hints,&abase))) {
-        logerr(0,"Lookup failed for address %s/service %s: %s",address,service,gai_strerror(err));
-        return(NULL);
-    }
-    for (aptr=abase;aptr;aptr=aptr->ai_next) {
-        if (aptr->ai_family == AF_INET || (aptr->ai_family  == AF_INET6 &&
-                ifu->type != UDP_BROADCAST))
-            break;
-    }
-    if (!aptr) {
-        logerr(0,"No Suitable address found for %s/%s",address,service);
+        if (ifu->type == UDP_BROADCAST)
+            hints.ai_family=AF_INET;
+        else
+            hints.ai_family=AF_UNSPEC;
+        hints.ai_socktype=SOCK_DGRAM;
+        hints.ai_protocol=IPPROTO_UDP;
+
+        if ((err=getaddrinfo(address,service,&hints,&abase))) {
+            logerr(0,"Lookup failed for address %s/service %s: %s",address,service,gai_strerror(err));
+            return(NULL);
+        }
+        for (aptr=abase;aptr;aptr=aptr->ai_next) {
+            if (aptr->ai_family == AF_INET || (aptr->ai_family  == AF_INET6 &&
+                    ifu->type != UDP_BROADCAST))
+                break;
+        }
+
+        if (!aptr) {
+            logerr(0,"No Suitable address found for %s/%s",address,service);
+            freeaddrinfo(abase);
+            return(NULL);
+        }
+
+        memcpy(sa,aptr->ai_addr,aptr->ai_addrlen);
+        ifu->asize=aptr->ai_addrlen;
         freeaddrinfo(abase);
-        return(NULL);
     }
-
-    memcpy(sa,aptr->ai_addr,aptr->ai_addrlen);
-    ifu->asize=aptr->ai_addrlen;
-    freeaddrinfo(abase);
 
     if (address) {
+
         if (ifu->type == UDP_UNSPEC || ifu->type == UDP_MULTICAST) {
             switch (is_multicast(sa)) {
             case 0:
@@ -460,7 +482,10 @@ struct iface *init_udp(struct iface *ifa)
                     return(NULL);
                 }
                 for (ifp=ifap;ifp;ifp=ifp->ifa_next)
-                    if ((ifp->ifa_addr->sa_family == AF_INET) &&
+                    /* Note that the definition of ifa_dstaddr varies by system
+                       but the usage below should work on all target platforms */
+                    if ((ifp->ifa_addr) && (ifp->ifa_addr->sa_family == AF_INET) &&
+                            (ifp->ifa_dstaddr != NULL) &&
                             (((struct sockaddr_in *)sa)->sin_addr.s_addr
                             == ((struct sockaddr_in *)(ifp->ifa_dstaddr))->sin_addr.s_addr))
                         break;
@@ -508,10 +533,15 @@ struct iface *init_udp(struct iface *ifa)
             if (ifname && strcmp(ifname,ifp->ifa_name))
                 continue;
             iffound++;
-            if ((address == NULL && ((ifp->ifa_addr->sa_family == AF_INET) ||
-                    (ifp->ifa_addr->sa_family == AF_INET6 &&
-                    ifa->direction == IN))) ||
-                    ifp->ifa_addr->sa_family == ifu->addr.ss_family)
+            if (ifp->ifa_addr == NULL)
+                continue;
+            if (ifp->ifa_addr->sa_family != AF_INET &&
+                    ifp->ifa_addr->sa_family != AF_INET6)
+                continue;
+            if ((address == NULL && (ifp->ifa_dstaddr != NULL)) ||
+                    ((ifp->ifa_addr->sa_family == ifu->addr.ss_family)  &&
+                    (ifa->direction == IN)) || ((address != NULL) &&
+                    ifp->ifa_addr->sa_family == ifu->addr.ss_family))
                 break;
         }
 
@@ -560,19 +590,13 @@ struct iface *init_udp(struct iface *ifa)
         }
 
         if (!address) {
+
             if (ifp->ifa_addr->sa_family == AF_INET)
                 ifu->asize=sizeof(struct sockaddr_in);
             else
                 ifu->asize=sizeof(struct sockaddr_in6);
 
-            if (ifa->direction == IN && ifu->type != UDP_BROADCAST) {
-                if ((sa->sa_family = ifp->ifa_addr->sa_family) == AF_INET)
-                    ((struct sockaddr_in *)sa)->sin_addr.s_addr =
-                            ((struct sockaddr_in *)ifp->ifa_addr)->sin_addr.s_addr;
-                else
-                    ((struct sockaddr_in6 *)sa)->sin6_addr =
-                            ((struct sockaddr_in6 *)ifp->ifa_addr)->sin6_addr;
-            } else {
+            if (ifa->direction != IN) {
                 if (!(ifp->ifa_dstaddr)) {
                     logerr(0,"No output address specified for interface %s",
                             ifname);
@@ -599,10 +623,13 @@ struct iface *init_udp(struct iface *ifa)
                 if ((sa->sa_family=ifp->ifa_dstaddr->sa_family) == AF_INET) {
                     ((struct sockaddr_in *)sa)->sin_addr.s_addr = 
                         ((struct sockaddr_in *)ifp->ifa_dstaddr)->sin_addr.s_addr;
+                    ((struct sockaddr_in *)sa)->sin_port = htons(port);
                 } else {
                     ((struct sockaddr_in6 *)sa)->sin6_addr = 
                         ((struct sockaddr_in6 *)ifp->ifa_dstaddr)->sin6_addr;
+                    ((struct sockaddr_in6 *)sa)->sin6_port = htons(port);
                 }
+
                 if (ifu->type == UDP_BROADCAST || ifa->direction == BOTH) {
                     if ((laddr.ss_family=ifp->ifa_dstaddr->sa_family) ==
                             AF_INET) {
@@ -710,7 +737,7 @@ struct iface *init_udp(struct iface *ifa)
         }
 
         /* write queue initialization */
-        if ((ifa->q = init_q(qsize)) == NULL) {
+        if (init_q(ifa, qsize) < 0) {
             logerr(errno,"Could not create queue");
             return(NULL);
         }
@@ -729,13 +756,30 @@ struct iface *init_udp(struct iface *ifa)
      */
 #ifdef SO_BINDTODEVICE
     /* Linux: requires root privileges */
-    struct ifreq ifr;
-
     if (ifname) {
-        strncpy(ifr.ifr_ifrn.ifrn_name,ifname,IF_NAMESIZE);
-        setsockopt(ifu->fd,SOL_SOCKET,SO_BINDTODEVICE,&ifr,sizeof(ifr));
+        /* Is it a struct ifreq?  Is it a string? is it strlen + 1?  Seems
+        the length parameter tends to be ignored so if it's null terminated
+        and starts at the address pointed to we're fine */
+        if (setsockopt(ifu->fd,SOL_SOCKET,SO_BINDTODEVICE,ifname,
+                strlen(ifname)) == 0) {
+            DEBUG2(3,"%s: BINDTODEVICE failed on device %s",
+                   ifa->name,ifname);
+        } else {
+            DEBUG(3,"%s: BINDTODEVICE succeeded on device %s",
+                    ifa->name,ifname);
+        }
     }
 #endif
+
+    if (ifa->direction != IN) {
+        DEBUG(3,"%s: output address %s, port %d",ifa->name
+            ,inet_ntop(ifu->addr.ss_family,((ifu->addr.ss_family == AF_INET)?
+            (void*)&((struct sockaddr_in *)&ifu->addr)->sin_addr:
+            (void*)&((struct sockaddr_in6*)&ifu->addr)->sin6_addr),debugbuf,
+            INET6_ADDRSTRLEN),ntohs((ifu->addr.ss_family == AF_INET)?
+            ((struct sockaddr_in*)&ifu->addr)->sin_port:
+            ((struct sockaddr_in6*)&ifu->addr)->sin6_port));
+    }
 
     ifa->write=write_udp;
     ifa->read=do_read;
@@ -776,7 +820,16 @@ struct iface *init_udp(struct iface *ifa)
         /* Platform-specific interface binding for read side */
 #ifdef SO_BINDTODEVICE
         /* Linux */
-        setsockopt(ifu->fd,SOL_SOCKET,SO_BINDTODEVICE,&ifr,sizeof(ifr));
+        if (ifname) {
+            if (setsockopt(ifu->fd,SOL_SOCKET,SO_BINDTODEVICE,ifname,
+                    strlen(ifname)) == 0) {
+                DEBUG2(3,"%s: BINDTODEVICE failed (read) to device %s",
+                        ifa->name,ifname);
+            } else {
+                DEBUG(3,"%s: BINDTODEVICE succeeded (read) to device %s",
+                    ifa->name,ifname);
+            }
+        }
 #endif
 
     }
@@ -810,9 +863,16 @@ struct iface *init_udp(struct iface *ifa)
             }
         }
         if (bind(ifu->fd,sa,ifu->asize) < 0) {
-            logerr(errno,"Duplicate bind failed");
+            logerr(errno,"bind failed for udp interface %s",ifa->name);
             return(NULL);
         }
+        DEBUG(3,"udp interface %s listening on %s, port %d",ifa->name,
+            inet_ntop(sa->sa_family,((sa->sa_family == AF_INET)?
+            (void*)&((struct sockaddr_in*)sa)->sin_addr:
+            (void*)&((struct sockaddr_in6*)sa)->sin6_addr),debugbuf,
+            INET6_ADDRSTRLEN),
+            ntohs((sa->sa_family==AF_INET)?((struct sockaddr_in*)sa)->sin_port:
+            ((struct sockaddr_in6*)sa)->sin6_port));
     }
 
     free_options(ifa->options);

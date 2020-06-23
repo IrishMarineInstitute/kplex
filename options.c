@@ -1,6 +1,6 @@
 /* options.c.
  * This flie is part of kplex.
- * Copyright Keith Young 2012-2015
+ * Copyright Keith Young 2012-2017
  * For copying information see the file COPYING distributed with this software
  *
  * This file deals with option parsing, either from a file or the command
@@ -14,6 +14,7 @@
 #define ARGDELIM ','
 #define FILTERDELIM ':'
 #define FILTEROPTDELIM '/'
+#define FILTERSRCDELIM '%'
 
 /* This is used before we start multiple threads */
 static char configbuf[BUFSIZE];
@@ -243,6 +244,7 @@ sfilter_t *getfilter(char *fstring)
         ok=0;
         if ((tfilter=(sf_rule_t *)malloc(sizeof(sf_rule_t))) == NULL)
             break;
+        memset((void *)tfilter,0,sizeof(sf_rule_t));
         tfilter->next=NULL;
         if (*fstring == '+')
             tfilter->type=ACCEPT;
@@ -265,13 +267,23 @@ sfilter_t *getfilter(char *fstring)
         } else {
             for (sptr=tfilter->match,i=0;i<5;i++,fstring++) {
                 if (*fstring == '\0' || *fstring == FILTERDELIM ||
-                        *fstring == FILTEROPTDELIM)
+                        *fstring == FILTEROPTDELIM ||
+                        *fstring == FILTERSRCDELIM)
                     break;
                 *sptr++=(*fstring == '*')?0:*fstring;
             }
         }
 
-        if(*fstring == FILTEROPTDELIM) {
+        if (*fstring == FILTERSRCDELIM) {
+            sptr=++fstring;
+            while (*fstring && *fstring != FILTERDELIM &&
+                    *fstring != FILTEROPTDELIM)
+                fstring++;
+            if ((tfilter->src.name = strndup(sptr,fstring-sptr)) == NULL)
+                break;
+        }
+
+        if (*fstring == FILTEROPTDELIM) {
             if (tfilter->type == LIMIT) {
                 while(*++fstring) {
                     if (*fstring >= '0' && *fstring <= '9') 
@@ -405,6 +417,7 @@ int add_common_opt(char *var, char *val,iface_t *ifp)
             return(-1);
         for (ptr=ifp->name;*val;)
                 *ptr++= *val++;
+        *ptr='\0';
     } else
         return(1);
 
@@ -513,8 +526,6 @@ iface_t *parse_file(char *fname)
             ifg->flags=0;
             ifg->logto=LOG_DAEMON;
             ifp->info = (void *)ifg;
-            if (ifp->strict <0)
-                ifp->strict = 1;
             if (ifp->checksum <0)
                 ifp->checksum = 0;
 

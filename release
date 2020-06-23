@@ -1,14 +1,15 @@
 #!/bin/bash
-VERSION=`git describe --abbrev=0 | sed 's/^v//'`
+VERSION=`git describe --abbrev=0 | sed 's/^v//;s/beta/~beta/;s/\(rc[0-9]*$\)/~\1/'`
 VDIR=/tmp/kplex-$VERSION
 rm -rf $VDIR
 mkdir $VDIR
 make clean
 echo "#define VERSION \"$VERSION\"" > version.h
 cp * $VDIR
-rm $VDIR/release
-echo "/^CFLAGS=/s/^/#/
+rm $VDIR/release $VDIR/base_version
+echo "/^all:/s/version //
++1,/^kplex:/-2d
 $
--6,.d
+-3,.d
 w" | ed -s $VDIR/Makefile >/dev/null
 (cd /tmp && tar cf - ${VDIR##*/} | gzip > kplex-${VERSION}.tgz)

@@ -1,6 +1,6 @@
 /* serial.c
  * This file is part of kplex
- * Copyright Keith Young 2012 - 2014
+ * Copyright Keith Young 2012 - 2016
  * For copying information see the file COPYING distributed with this software
  *
  * This file contains code for serial-like interfaces. This currently
@@ -23,7 +23,7 @@
 #include <grp.h>
 #include <pwd.h>
 
-#define DEFSERIALQSIZE 128
+#define DEFSERIALQSIZE 32
 
 struct if_serial {
     int fd;
@@ -307,6 +307,14 @@ struct iface *init_serial (struct iface *ifa)
                 baud=B57600;
             else if (!strcmp(opt->val,"115200"))
                 baud=B115200;
+#ifdef B230400
+            else if (!strcmp(opt->val,"230400"))
+                baud=B230400;
+#endif
+#ifdef B460800
+            else if (!strcmp(opt->val,"460800"))
+                baud=B460800;
+#endif
             else {
                 logerr(0,"Unsupported baud rate \'%s\' in interface specification '\%s\'",opt->val,devname);
                 return(NULL);
@@ -332,6 +340,9 @@ struct iface *init_serial (struct iface *ifa)
     if ((ifs->fd=ttyopen(devname,ifa->direction)) < 0) {
         return(NULL);
     }
+    DEBUG(3,"%s: opened serial device %s for %s",ifa->name,devname,
+            (ifa->direction==IN)?"input":(ifa->direction==OUT)?"output":
+            "input/output");
 
     free_options(ifa->options);
 
@@ -355,7 +366,7 @@ struct iface *init_serial (struct iface *ifa)
 
     /* Allocate queue for outbound interfaces */
     if (ifa->direction != IN)
-        if ((ifa->q =init_q(qsize)) == NULL) {
+        if (init_q(ifa, qsize) < 0) {
             logerr(errno,"Could not create queue");
             cleanup_serial(ifa);
             return(NULL);
@@ -384,6 +395,7 @@ struct iface *init_serial (struct iface *ifa)
 struct iface *init_pty (struct iface *ifa)
 {
     char *devname=NULL;
+    char* baudstr="4800";
     struct if_serial *ifs;
     int baud=B4800,slavefd;
     int ret;
@@ -438,6 +450,7 @@ struct iface *init_pty (struct iface *ifa)
                 return 0;
             }
         } else if (!strcasecmp(opt->var,"baud")) {
+            baudstr=opt->val;
             if (!strcmp(opt->val,"38400"))
                 baud=B38400;
             else if (!strcmp(opt->val,"9600"))
@@ -510,13 +523,15 @@ struct iface *init_pty (struct iface *ifa)
                 logerr(errno,"Could not create symbolic link %s for %s",devname,slave);
                 return(NULL);
             }
+            DEBUG(3,"%s: created pty link %s to %s",ifa->name,devname,slave);
+
             /* Save the name to unlink it on exit */
             if ((ifs->slavename=strdup(devname)) == NULL) {
                 logerr(errno,"Failed to save device name. Link will not be removed on exit");
             }
         } else
     /* No device name was given: Just print the pty name */
-            loginfo("Slave pty for output at %s baud is %s",(baud==B4800)?"4800":(baud==B9600)?"9600": "38.4k",slave);
+            loginfo("Slave pty for output at %s baud is %s",baudstr,slave);
     } else {
     /* Slave mode: This is no different from a serial line */
         if (!devname) {
@@ -526,6 +541,9 @@ struct iface *init_pty (struct iface *ifa)
         if ((ifs->fd=ttyopen(devname,ifa->direction)) < 0) {
             return(NULL);
         }
+        DEBUG(3,"%s: opened pty slave %s for %s",ifa->name,devname,
+                (ifa->direction==IN)?"input":(ifa->direction==OUT)?"output":
+                "input/output");
     }
 
     free_options(ifa->options);
@@ -546,7 +564,7 @@ struct iface *init_pty (struct iface *ifa)
     ifa->cleanup=cleanup_serial;
 
     if (ifa->direction != IN)
-        if ((ifa->q =init_q(qsize)) == NULL) {
+        if (init_q(ifa, qsize) < 0) {
             logerr(errno,"Could not create queue");
             cleanup_serial(ifa);
             return(NULL);
